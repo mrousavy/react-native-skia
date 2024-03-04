@@ -44,27 +44,11 @@ public:
  */
 class WindowSurfaceHolder {
 public:
-  WindowSurfaceHolder(jobject jSurfaceTexture, int width, int height)
+  WindowSurfaceHolder(jobject jSurface, int width, int height)
       : _width(width), _height(height) {
-    JNIEnv *env = facebook::jni::Environment::current();
-    _jSurfaceTexture = env->NewGlobalRef(jSurfaceTexture);
-    jclass surfaceClass = env->FindClass("android/view/Surface");
-    jmethodID surfaceConstructor = env->GetMethodID(
-        surfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
-    // Create a new Surface instance
-    jobject jSurface =
-        env->NewObject(surfaceClass, surfaceConstructor, jSurfaceTexture);
-
-    jclass surfaceTextureClass = env->GetObjectClass(_jSurfaceTexture);
-    _updateTexImageMethod =
-        env->GetMethodID(surfaceTextureClass, "updateTexImage", "()V");
-
     // Acquire the native window from the Surface
+    JNIEnv *env = facebook::jni::Environment::current();
     _window = ANativeWindow_fromSurface(env, jSurface);
-    // Clean up local references
-    env->DeleteLocalRef(jSurface);
-    env->DeleteLocalRef(surfaceClass);
-    env->DeleteLocalRef(surfaceTextureClass);
   }
 
   ~WindowSurfaceHolder() {
@@ -82,17 +66,6 @@ public:
   sk_sp<SkSurface> getSurface();
 
   void updateTexImage() {
-    JNIEnv *env = facebook::jni::Environment::current();
-
-    // Call updateTexImage on the SurfaceTexture object
-    env->CallVoidMethod(_jSurfaceTexture, _updateTexImageMethod);
-
-    // Check for exceptions
-    if (env->ExceptionCheck()) {
-      RNSkLogger::logToConsole("updateAndRelease() failed. The exception above "
-                               "can safely be ignored");
-      env->ExceptionClear();
-    }
   }
 
   /**
@@ -134,7 +107,6 @@ private:
   sk_sp<SkSurface> _skSurface = nullptr;
   jobject _jSurfaceTexture = nullptr;
   EGLSurface _glSurface = EGL_NO_SURFACE;
-  jmethodID _updateTexImageMethod = nullptr;
   int _width = 0;
   int _height = 0;
 };
@@ -150,15 +122,15 @@ public:
   static sk_sp<SkSurface> makeOffscreenSurface(int width, int height);
 
   /**
-   * Creates a windowed Skia Surface holder.
+   * Creates a windowed Skia Surface holder from a Java Surface.
    * @param width Initial width of surface
    * @param height Initial height of surface
-   * @param window Window coming from Java
+   * @param surface Window (android.graphics.Surface) coming from Java
    * @return A Surface holder
    */
   static std::unique_ptr<WindowSurfaceHolder>
-  makeWindowedSurface(jobject window, int width, int height) {
-    return std::make_unique<WindowSurfaceHolder>(window, width, height);
+  makeWindowedSurface(jobject surface, int width, int height) {
+    return std::make_unique<WindowSurfaceHolder>(surface, width, height);
   }
 };
 
