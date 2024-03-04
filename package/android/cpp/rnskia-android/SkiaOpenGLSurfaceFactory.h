@@ -47,6 +47,7 @@ public:
   WindowSurfaceHolder(jobject jSurface, int width, int height)
       : _width(width), _height(height) {
     // Acquire the native window from the Surface
+    JNIEnv *env = facebook::jni::Environment::current();
     _window = ANativeWindow_fromSurface(env, jSurface);
   }
 
