@@ -32,7 +32,11 @@ public:
 
   void surfaceSizeChanged(int width, int height);
 
+  void updateTexImage();
+
 private:
+  jobject _jSurfaceTexture = nullptr;
+  jmethodID _updateTexImageMethod = nullptr;
   std::unique_ptr<WindowSurfaceHolder> _surfaceHolder = nullptr;
   std::shared_ptr<RNSkPlatformContext> _platformContext;
 };
