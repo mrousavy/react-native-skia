@@ -184,7 +184,7 @@ SkYUVAInfo::PlaneConfig getPlaneConfig(OSType pixelFormat) {
     case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
     case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
     case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
-      return SkYUVAInfo::PlaneConfig::kY_VU;
+      return SkYUVAInfo::PlaneConfig::kY_UV;
     case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
     case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
       return SkYUVAInfo::PlaneConfig::kY_U_V;
@@ -289,7 +289,6 @@ GrYUVABackendTextures SkiaMetalSurfaceFactory::getYUVTexturesFromCVPixelBuffer(C
 
   for (size_t planeIndex = 0; planeIndex < planesCount; planeIndex++) {
     MTLPixelFormat pixelFormat = getMTLPixelFormatForCVPixelBufferPlane(pixelBuffer, planeIndex);
-    NSLog(@"Plane %zu is in %zu", planeIndex, pixelFormat);
     GrBackendTexture texture = getTextureFromCVPixelBuffer(pixelBuffer, planeIndex, pixelFormat);
     textures[planeIndex] = texture;
   }
