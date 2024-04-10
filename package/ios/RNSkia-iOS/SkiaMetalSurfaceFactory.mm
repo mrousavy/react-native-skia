@@ -285,7 +285,7 @@ MTLPixelFormat getMTLPixelFormatForCVPixelBufferPlane(CVPixelBufferRef pixelBuff
 GrYUVABackendTextures SkiaMetalSurfaceFactory::getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer) {
   // 1. Get all planes (YUV, Y_UV, Y_U_V or Y_U_V_A)
   size_t planesCount = CVPixelBufferGetPlaneCount(pixelBuffer);
-  GrBackendTexture textures[SkYUVAInfo::kMaxPlanes];
+  GrBackendTexture textures[planesCount];
 
   for (size_t planeIndex = 0; planeIndex < planesCount; planeIndex++) {
     MTLPixelFormat pixelFormat = getMTLPixelFormatForCVPixelBufferPlane(pixelBuffer, planeIndex);
@@ -343,8 +343,6 @@ sk_sp<SkImage> SkiaMetalSurfaceFactory::makeImageFromCMSampleBuffer(
   }
 
   CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-  double width = CVPixelBufferGetWidth(pixelBuffer);
-  double height = CVPixelBufferGetHeight(pixelBuffer);
 
   // Make sure the format is RGB (BGRA_8888)
   CVPixelBufferBaseFormat baseFormat = getCVPixelBufferBaseFormat(pixelBuffer);
