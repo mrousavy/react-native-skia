@@ -13,6 +13,8 @@
 #import <include/gpu/GrDirectContext.h>
 #import <include/gpu/ganesh/SkImageGanesh.h>
 #import <include/gpu/ganesh/SkSurfaceGanesh.h>
+#import <include/gpu/GrYUVABackendTextures.h>
+#import <include/core/SkYUVAInfo.h>
 
 #pragma clang diagnostic pop
 
@@ -31,7 +33,23 @@
   }
 #endif
 
-thread_local SkiaMetalContext ThreadContextHolder::ThreadSkiaMetalContext;
+thread_local std::unique_ptr<SkiaMetalContext> ThreadContextHolder::ThreadSkiaMetalContext = std::make_unique<SkiaMetalContext>();
+
+const std::unique_ptr<SkiaMetalContext>& ThreadContextHolder::getThreadSpecificSkiaContext() {
+  const std::unique_ptr<SkiaMetalContext>& context = ThreadContextHolder::ThreadSkiaMetalContext;
+  if (context->skContext == nullptr) {
+    context->device = MTLCreateSystemDefaultDevice();
+    context->commandQueue =
+        id<MTLCommandQueue>(CFRetain((GrMTLHandle)[context->device newCommandQueue]));
+    context->skContext = GrDirectContext::MakeMetal(
+        (__bridge void *)context->device,
+        (__bridge void *)context->commandQueue);
+    if (context->skContext == nullptr) {
+      throw std::runtime_error("Failed to create thread-specific Skia context!");
+    }
+  }
+  return context;
+}
 
 struct OffscreenRenderContext {
   id<MTLTexture> texture;
@@ -52,39 +70,18 @@ struct OffscreenRenderContext {
   }
 };
 
-id<MTLDevice> SkiaMetalSurfaceFactory::device = MTLCreateSystemDefaultDevice();
-
-bool SkiaMetalSurfaceFactory::createSkiaDirectContextIfNecessary(
-    SkiaMetalContext *skiaMetalContext) {
-  if (skiaMetalContext->skContext == nullptr) {
-    skiaMetalContext->commandQueue =
-        id<MTLCommandQueue>(CFRetain((GrMTLHandle)[device newCommandQueue]));
-    skiaMetalContext->skContext = GrDirectContext::MakeMetal(
-        (__bridge void *)device,
-        (__bridge void *)skiaMetalContext->commandQueue);
-    if (skiaMetalContext->skContext == nullptr) {
-      RNSkia::RNSkLogger::logToConsole("Couldn't create a Skia Metal Context");
-      return false;
-    }
-  }
-  return true;
-}
 
 sk_sp<SkSurface>
 SkiaMetalSurfaceFactory::makeWindowedSurface(id<MTLTexture> texture, int width,
                                              int height) {
-  // Get render context for current thread
-  if (!SkiaMetalSurfaceFactory::createSkiaDirectContextIfNecessary(
-          &ThreadContextHolder::ThreadSkiaMetalContext)) {
-    return nullptr;
-  }
+  // Ensure Skia context is available
+  const auto& context = ThreadContextHolder::getThreadSpecificSkiaContext();
   GrMtlTextureInfo fbInfo;
   fbInfo.fTexture.retain((__bridge void *)texture);
 
   GrBackendRenderTarget backendRT(width, height, fbInfo);
 
-  auto skSurface = SkSurfaces::WrapBackendRenderTarget(
-      ThreadContextHolder::ThreadSkiaMetalContext.skContext.get(), backendRT,
+  auto skSurface = SkSurfaces::WrapBackendRenderTarget(context->skContext.get(), backendRT,
       kTopLeft_GrSurfaceOrigin, kBGRA_8888_SkColorType, nullptr, nullptr);
 
   if (skSurface == nullptr || skSurface->getCanvas() == nullptr) {
@@ -97,13 +94,8 @@ SkiaMetalSurfaceFactory::makeWindowedSurface(id<MTLTexture> texture, int width,
 
 sk_sp<SkSurface> SkiaMetalSurfaceFactory::makeOffscreenSurface(int width,
                                                                int height) {
-  if (!SkiaMetalSurfaceFactory::createSkiaDirectContextIfNecessary(
-          &ThreadContextHolder::ThreadSkiaMetalContext)) {
-    return nullptr;
-  }
-  auto ctx = new OffscreenRenderContext(
-      device, ThreadContextHolder::ThreadSkiaMetalContext.skContext,
-      ThreadContextHolder::ThreadSkiaMetalContext.commandQueue, width, height);
+  const auto& context = ThreadContextHolder::getThreadSpecificSkiaContext();
+  auto ctx = new OffscreenRenderContext(context->device, context->skContext, context->commandQueue, width, height);
 
   // Create a GrBackendTexture from the Metal texture
   GrMtlTextureInfo info;
@@ -111,8 +103,7 @@ sk_sp<SkSurface> SkiaMetalSurfaceFactory::makeOffscreenSurface(int width,
   GrBackendTexture backendTexture(width, height, skgpu::Mipmapped::kNo, info);
 
   // Create a SkSurface from the GrBackendTexture
-  auto surface = SkSurfaces::WrapBackendTexture(
-      ThreadContextHolder::ThreadSkiaMetalContext.skContext.get(),
+  auto surface = SkSurfaces::WrapBackendTexture(context->skContext.get(),
       backendTexture, kTopLeft_GrSurfaceOrigin, 0, kBGRA_8888_SkColorType,
       nullptr, nullptr,
       [](void *addr) { delete (OffscreenRenderContext *)addr; }, ctx);
@@ -121,11 +112,13 @@ sk_sp<SkSurface> SkiaMetalSurfaceFactory::makeOffscreenSurface(int width,
 }
 
 CVMetalTextureCacheRef SkiaMetalSurfaceFactory::getTextureCache() {
+
   static thread_local CVMetalTextureCacheRef textureCache = nil;
   static thread_local size_t accessCounter = 0;
   if (textureCache == nil) {
     // Create a new Texture Cache
-    auto result = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device,
+    const auto& context = ThreadContextHolder::getThreadSpecificSkiaContext();
+    auto result = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, context->device,
                                             nil, &textureCache);
     if (result != kCVReturnSuccess || textureCache == nil) {
       throw std::runtime_error("Failed to create Metal Texture Cache!");
@@ -141,12 +134,231 @@ CVMetalTextureCacheRef SkiaMetalSurfaceFactory::getTextureCache() {
   return textureCache;
 }
 
+MetalTextureHolder::MetalTextureHolder(CVMetalTextureRef metalTexture): _metalTexture(metalTexture) {
+  // 1. Unwrap the underlying MTLTexture
+  id<MTLTexture> mtlTexture = CVMetalTextureGetTexture(metalTexture);
+  if (mtlTexture == nil) {
+    throw std::runtime_error("Failed to get MTLTexture from CVMetalTextureRef!");
+  }
+
+  // 2. Wrap MTLTexture in Skia's GrBackendTexture
+  GrMtlTextureInfo textureInfo;
+  textureInfo.fTexture.retain((__bridge void *)mtlTexture);
+  _skiaTexture = GrBackendTexture((int)mtlTexture.width, (int)mtlTexture.height,
+                                  skgpu::Mipmapped::kNo, textureInfo);
+
+  // 3. Increment ref-count on MetalTexture
+  CFRetain(_metalTexture);
+}
+
+MetalTextureHolder::~MetalTextureHolder() {
+  CFRelease(_metalTexture);
+}
+
+MetalTextureHolder SkiaMetalSurfaceFactory::getTextureFromCVPixelBuffer(CVPixelBufferRef pixelBuffer, size_t planeIndex, MTLPixelFormat pixelFormat) {
+  // 1. Get cache
+  CVMetalTextureCacheRef textureCache = getTextureCache();
+
+  // 2. Get MetalTexture from CMSampleBuffer
+  CVMetalTextureRef textureHolder;
+  size_t width = CVPixelBufferGetWidthOfPlane(pixelBuffer, planeIndex);
+  size_t height = CVPixelBufferGetHeightOfPlane(pixelBuffer, planeIndex);
+  CVReturn result = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil,
+                                                              pixelFormat, width, height, planeIndex, &textureHolder);
+  if (result != kCVReturnSuccess) {
+    throw std::runtime_error("Failed to create Metal Texture from CMSampleBuffer! Result: " +
+                             std::to_string(result));
+  }
+
+  // 3. Convert to a MetalTextureHolder
+  return MetalTextureHolder(textureHolder);
+}
+
+SkYUVAInfo::PlaneConfig getPlaneConfig(OSType pixelFormat) {
+  switch (pixelFormat) {
+    case kCVPixelFormatType_420YpCbCr8Planar:
+    case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+      return SkYUVAInfo::PlaneConfig::kYUV;
+    case kCVPixelFormatType_422YpCbCr_4A_8BiPlanar:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
+      return SkYUVAInfo::PlaneConfig::kY_VU;
+    case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
+    case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
+      return SkYUVAInfo::PlaneConfig::kY_U_V;
+    default:
+      throw std::runtime_error("Invalid pixel format! " + std::string(FourCC2Str(pixelFormat)));
+  }
+}
+SkYUVAInfo::Subsampling getSubsampling(OSType pixelFormat) {
+  switch (pixelFormat) {
+    case kCVPixelFormatType_420YpCbCr8Planar:
+    case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
+      return SkYUVAInfo::Subsampling::k420;
+    case kCVPixelFormatType_4444YpCbCrA8:
+    case kCVPixelFormatType_4444YpCbCrA8R:
+    case kCVPixelFormatType_4444AYpCbCr8:
+    case kCVPixelFormatType_4444AYpCbCr16:
+    case kCVPixelFormatType_4444AYpCbCrFloat:
+    case kCVPixelFormatType_444YpCbCr8:
+    case kCVPixelFormatType_444YpCbCr10:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
+      return SkYUVAInfo::Subsampling::k444;
+    case kCVPixelFormatType_422YpCbCr8:
+    case kCVPixelFormatType_422YpCbCr16:
+    case kCVPixelFormatType_422YpCbCr10:
+    case kCVPixelFormatType_422YpCbCr_4A_8BiPlanar:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr8_yuvs:
+    case kCVPixelFormatType_422YpCbCr8FullRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
+      return SkYUVAInfo::Subsampling::k422;
+    default:
+      throw std::runtime_error("Invalid pixel format! " + std::string(FourCC2Str(pixelFormat)));
+  }
+}
+SkYUVColorSpace getColorspace(OSType pixelFormat) {
+  switch (pixelFormat) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
+    case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
+      return SkYUVColorSpace::kRec709_Limited_SkYUVColorSpace;
+    case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr8FullRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+      return SkYUVColorSpace::kRec709_Full_SkYUVColorSpace;
+    default:
+      throw std::runtime_error("Invalid pixel format! " + std::string(FourCC2Str(pixelFormat)));
+  }
+}
+
+SkYUVAInfo SkiaMetalSurfaceFactory::getYUVAInfoForCVPixelBuffer(CVPixelBufferRef pixelBuffer) {
+  SkISize size = SkISize::Make(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer));
+  OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  SkYUVAInfo::PlaneConfig planeConfig = getPlaneConfig(format);
+  SkYUVAInfo::Subsampling subsampling = getSubsampling(format);
+  SkYUVColorSpace colorspace = getColorspace(format);
+  return SkYUVAInfo(size, planeConfig, subsampling, colorspace);
+}
+MTLPixelFormat getMTLPixelFormatForCVPixelBufferPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex) {
+  size_t width = CVPixelBufferGetWidthOfPlane(pixelBuffer, planeIndex);
+  size_t bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, planeIndex);
+  double bytesPerPixel = round(static_cast<double>(bytesPerRow) / width);
+  if (bytesPerPixel == 1) {
+    return MTLPixelFormatR8Unorm;
+  } else if (bytesPerPixel == 2) {
+    return MTLPixelFormatRG8Unorm;
+  } else if (bytesPerPixel == 4) {
+    return MTLPixelFormatRGBA8Unorm;
+  } else {
+    throw std::runtime_error("Invalid bytes per row! Expected 1 (R), 2 (RG) or 4 (RGBA), but received " + std::to_string(bytesPerPixel));
+  }
+}
+
+YUVMetalTexturesHolder::YUVMetalTexturesHolder(SkYUVAInfo yuvInfo, std::vector<MetalTextureHolder> textures): _yuvInfo(yuvInfo), _textures(textures) { }
+YUVMetalTexturesHolder::~YUVMetalTexturesHolder() { }
+GrYUVABackendTextures YUVMetalTexturesHolder::getSkiaTexture() {
+  GrBackendTexture textures[SkYUVAInfo::kMaxPlanes];
+  for (size_t i = 0; i < _textures.size(); i++) {
+    const MetalTextureHolder& holder = _textures.at(i);
+    textures[i] = holder.getSkiaTexture();
+  }
+  return GrYUVABackendTextures(_yuvInfo, textures, kTopLeft_GrSurfaceOrigin);
+}
+
+YUVMetalTexturesHolder* SkiaMetalSurfaceFactory::getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer) {
+  // 1. Get all planes (YUV, Y_UV, Y_U_V or Y_U_V_A)
+  size_t planesCount = CVPixelBufferGetPlaneCount(pixelBuffer);
+  std::vector<MetalTextureHolder> yuvTextures;
+  yuvTextures.reserve(planesCount);
+
+  for (size_t planeIndex = 0; planeIndex < planesCount; planeIndex++) {
+    MTLPixelFormat pixelFormat = getMTLPixelFormatForCVPixelBufferPlane(pixelBuffer, planeIndex);
+    MetalTextureHolder textureHolder = getTextureFromCVPixelBuffer(pixelBuffer, planeIndex, pixelFormat);
+    yuvTextures.push_back(textureHolder);
+  }
+
+  // 2. Wrap info about buffer
+  SkYUVAInfo info = getYUVAInfoForCVPixelBuffer(pixelBuffer);
+
+  // 3. Return all textures
+  return new YUVMetalTexturesHolder(info, yuvTextures);
+}
+
+CVPixelBufferBaseFormat SkiaMetalSurfaceFactory::getCVPixelBufferBaseFormat(CVPixelBufferRef pixelBuffer) {
+  OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  switch (format) {
+    // 8-bit YUV formats
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+    // 10-bit YUV formats
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+    case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+      return CVPixelBufferBaseFormat::yuv;
+    case kCVPixelFormatType_24RGB:
+    case kCVPixelFormatType_24BGR:
+    case kCVPixelFormatType_32ARGB:
+    case kCVPixelFormatType_32BGRA:
+    case kCVPixelFormatType_32ABGR:
+    case kCVPixelFormatType_32RGBA:
+    case kCVPixelFormatType_64ARGB:
+    case kCVPixelFormatType_64RGBALE:
+    case kCVPixelFormatType_48RGB:
+    case kCVPixelFormatType_30RGB:
+      return CVPixelBufferBaseFormat::rgb;
+    default:
+      throw std::runtime_error("Invalid CVPixelBuffer format! " + std::string(FourCC2Str(format)));
+  }
+}
+
 sk_sp<SkImage> SkiaMetalSurfaceFactory::makeImageFromCMSampleBuffer(
     CMSampleBufferRef sampleBuffer) {
-  if (!SkiaMetalSurfaceFactory::createSkiaDirectContextIfNecessary(
-          &ThreadContextHolder::ThreadSkiaMetalContext)) {
-    throw std::runtime_error("Failed to create Skia Context for this Thread!");
-  }
+  const auto& context = ThreadContextHolder::getThreadSpecificSkiaContext();
 
   if (!CMSampleBufferIsValid(sampleBuffer)) {
     throw std::runtime_error("The given CMSampleBuffer is not valid!");
@@ -157,51 +369,28 @@ sk_sp<SkImage> SkiaMetalSurfaceFactory::makeImageFromCMSampleBuffer(
   double height = CVPixelBufferGetHeight(pixelBuffer);
 
   // Make sure the format is RGB (BGRA_8888)
-  OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
-  if (format != kCVPixelFormatType_32BGRA) {
-    // TODO: Also support YUV (kCVPixelFormatType_420YpCbCr8Planar) as that is
-    // much more efficient!
-    auto error = std::string("CMSampleBuffer has unknown Pixel Format (") +
-                 FourCC2Str(format) +
-                 std::string(") - cannot convert to SkImage!");
-    throw std::runtime_error(error);
+  CVPixelBufferBaseFormat baseFormat = getCVPixelBufferBaseFormat(pixelBuffer);
+  switch (baseFormat) {
+    case CVPixelBufferBaseFormat::rgb: {
+      // It's in RGB (BGRA_32), single plane
+      MetalTextureHolder backendTexture = getTextureFromCVPixelBuffer(pixelBuffer, 0, MTLPixelFormatBGRA8Unorm);
+      auto image = SkImages::AdoptTextureFrom(context->skContext.get(), backendTexture.getSkiaTexture(), kTopLeft_GrSurfaceOrigin,
+                                              kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
+      return image;
+    }
+    case CVPixelBufferBaseFormat::yuv: {
+      // It's in YUV, multi-plane
+      YUVMetalTexturesHolder* textures = getYUVTexturesFromCVPixelBuffer(pixelBuffer);
+      GrYUVABackendTextures yuvTextures = textures->getSkiaTexture();
+
+      auto image = SkImages::TextureFromYUVATextures(context->skContext.get(), yuvTextures, nullptr, [](void* context) {
+        YUVMetalTexturesHolder* textures = (YUVMetalTexturesHolder*)context;
+        delete textures;
+      }, (void*)textures);
+      return image;
+    }
+    default: {
+      throw std::runtime_error("Unknown PixelBuffer format!");
+    }
   }
-
-  CVMetalTextureCacheRef textureCache = getTextureCache();
-
-  // Convert CMSampleBuffer* -> CVMetalTexture*
-  CVMetalTextureRef cvTexture;
-  CVReturn result = CVMetalTextureCacheCreateTextureFromImage(
-      kCFAllocatorDefault, textureCache, pixelBuffer, nil,
-      MTLPixelFormatBGRA8Unorm, width, height,
-      0, // plane index
-      &cvTexture);
-  if (result != kCVReturnSuccess) {
-    throw std::runtime_error(
-        "Failed to create Metal Texture from CMSampleBuffer! Result: " +
-        std::to_string(result));
-  }
-
-  id<MTLTexture> mtlTexture = CVMetalTextureGetTexture(cvTexture);
-  if (mtlTexture == nil) {
-    throw std::runtime_error(
-        "Failed to convert CMSampleBuffer to SkImage - cannot get MTLTexture!");
-  }
-
-  // Convert the rendered MTLTexture to an SkImage
-  GrMtlTextureInfo textureInfo;
-  textureInfo.fTexture.retain((__bridge void *)mtlTexture);
-  GrBackendTexture backendTexture((int)mtlTexture.width, (int)mtlTexture.height,
-                                  skgpu::Mipmapped::kNo, textureInfo);
-
-  auto context = ThreadContextHolder::ThreadSkiaMetalContext.skContext;
-  // TODO: Adopt or Borrow?
-  auto image = SkImages::AdoptTextureFrom(
-      context.get(), backendTexture, kTopLeft_GrSurfaceOrigin,
-      kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
-
-  // Release the Texture wrapper (it will still be strong)
-  CFRelease(cvTexture);
-
-  return image;
 }
