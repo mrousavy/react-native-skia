@@ -18,30 +18,6 @@ using SkiaMetalContext = struct SkiaMetalContext {
   sk_sp<GrDirectContext> skContext = nullptr;
 };
 
-class MetalTextureHolder {
-public:
-  explicit MetalTextureHolder(CVMetalTextureRef metalTexture);
-  ~MetalTextureHolder();
-
-  const GrBackendTexture& getSkiaTexture() const { return _skiaTexture; }
-
-private:
-  CVMetalTextureRef _metalTexture;
-  GrBackendTexture _skiaTexture;
-};
-
-class YUVMetalTexturesHolder {
-public:
-  explicit YUVMetalTexturesHolder(SkYUVAInfo yuvInfo, std::vector<MetalTextureHolder> textures);
-  ~YUVMetalTexturesHolder();
-
-  GrYUVABackendTextures getSkiaTexture();
-
-private:
-  SkYUVAInfo _yuvInfo;
-  std::vector<MetalTextureHolder> _textures;
-};
-
 enum class CVPixelBufferBaseFormat {
   yuv,
   rgb
@@ -60,14 +36,13 @@ public:
                                               int height);
   static sk_sp<SkSurface> makeOffscreenSurface(int width, int height);
 
-  static sk_sp<SkImage>
-  makeImageFromCMSampleBuffer(CMSampleBufferRef sampleBuffer);
+  static sk_sp<SkImage> makeImageFromCMSampleBuffer(CMSampleBufferRef sampleBuffer);
 
 private:
   static CVMetalTextureCacheRef getTextureCache();
 
-  static MetalTextureHolder getTextureFromCVPixelBuffer(CVPixelBufferRef pixelBuffer, size_t planeIndex, MTLPixelFormat pixelFormat);
-  static YUVMetalTexturesHolder* getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer);
+  static GrBackendTexture getTextureFromCVPixelBuffer(CVPixelBufferRef pixelBuffer, size_t planeIndex, MTLPixelFormat pixelFormat);
+  static GrYUVABackendTextures getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer);
   static CVPixelBufferBaseFormat getCVPixelBufferBaseFormat(CVPixelBufferRef pixelBuffer);
   static SkYUVAInfo getYUVAInfoForCVPixelBuffer(CVPixelBufferRef pixelBuffer);
 };

@@ -125,7 +125,7 @@ CVMetalTextureCacheRef SkiaMetalSurfaceFactory::getTextureCache() {
     }
   }
   accessCounter++;
-  if (accessCounter > 5) {
+  if (accessCounter > 15) {
     // Every 5 accesses, we perform some internal recycling/housekeeping
     // operations.
     CVMetalTextureCacheFlush(textureCache, 0);
@@ -134,28 +134,7 @@ CVMetalTextureCacheRef SkiaMetalSurfaceFactory::getTextureCache() {
   return textureCache;
 }
 
-MetalTextureHolder::MetalTextureHolder(CVMetalTextureRef metalTexture): _metalTexture(metalTexture) {
-  // 1. Unwrap the underlying MTLTexture
-  id<MTLTexture> mtlTexture = CVMetalTextureGetTexture(metalTexture);
-  if (mtlTexture == nil) {
-    throw std::runtime_error("Failed to get MTLTexture from CVMetalTextureRef!");
-  }
-
-  // 2. Wrap MTLTexture in Skia's GrBackendTexture
-  GrMtlTextureInfo textureInfo;
-  textureInfo.fTexture.retain((__bridge void *)mtlTexture);
-  _skiaTexture = GrBackendTexture((int)mtlTexture.width, (int)mtlTexture.height,
-                                  skgpu::Mipmapped::kNo, textureInfo);
-
-  // 3. Increment ref-count on MetalTexture
-  CFRetain(_metalTexture);
-}
-
-MetalTextureHolder::~MetalTextureHolder() {
-  CFRelease(_metalTexture);
-}
-
-MetalTextureHolder SkiaMetalSurfaceFactory::getTextureFromCVPixelBuffer(CVPixelBufferRef pixelBuffer, size_t planeIndex, MTLPixelFormat pixelFormat) {
+GrBackendTexture SkiaMetalSurfaceFactory::getTextureFromCVPixelBuffer(CVPixelBufferRef pixelBuffer, size_t planeIndex, MTLPixelFormat pixelFormat) {
   // 1. Get cache
   CVMetalTextureCacheRef textureCache = getTextureCache();
 
@@ -170,8 +149,19 @@ MetalTextureHolder SkiaMetalSurfaceFactory::getTextureFromCVPixelBuffer(CVPixelB
                              std::to_string(result));
   }
 
-  // 3. Convert to a MetalTextureHolder
-  return MetalTextureHolder(textureHolder);
+  // 2. Unwrap the underlying MTLTexture
+  id<MTLTexture> mtlTexture = CVMetalTextureGetTexture(textureHolder);
+  if (mtlTexture == nil) {
+    throw std::runtime_error("Failed to get MTLTexture from CVMetalTextureRef!");
+  }
+
+  // 3. Wrap MTLTexture in Skia's GrBackendTexture
+  GrMtlTextureInfo textureInfo;
+  textureInfo.fTexture.retain((__bridge void *)mtlTexture);
+  GrBackendTexture texture = GrBackendTexture((int)mtlTexture.width, (int)mtlTexture.height,
+                                  skgpu::Mipmapped::kNo, textureInfo);
+  CFRelease(textureHolder);
+  return texture;
 }
 
 SkYUVAInfo::PlaneConfig getPlaneConfig(OSType pixelFormat) {
@@ -292,34 +282,23 @@ MTLPixelFormat getMTLPixelFormatForCVPixelBufferPlane(CVPixelBufferRef pixelBuff
   }
 }
 
-YUVMetalTexturesHolder::YUVMetalTexturesHolder(SkYUVAInfo yuvInfo, std::vector<MetalTextureHolder> textures): _yuvInfo(yuvInfo), _textures(textures) { }
-YUVMetalTexturesHolder::~YUVMetalTexturesHolder() { }
-GrYUVABackendTextures YUVMetalTexturesHolder::getSkiaTexture() {
-  GrBackendTexture textures[SkYUVAInfo::kMaxPlanes];
-  for (size_t i = 0; i < _textures.size(); i++) {
-    const MetalTextureHolder& holder = _textures.at(i);
-    textures[i] = holder.getSkiaTexture();
-  }
-  return GrYUVABackendTextures(_yuvInfo, textures, kTopLeft_GrSurfaceOrigin);
-}
-
-YUVMetalTexturesHolder* SkiaMetalSurfaceFactory::getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer) {
+GrYUVABackendTextures SkiaMetalSurfaceFactory::getYUVTexturesFromCVPixelBuffer(CVPixelBufferRef pixelBuffer) {
   // 1. Get all planes (YUV, Y_UV, Y_U_V or Y_U_V_A)
   size_t planesCount = CVPixelBufferGetPlaneCount(pixelBuffer);
-  std::vector<MetalTextureHolder> yuvTextures;
-  yuvTextures.reserve(planesCount);
+  GrBackendTexture textures[SkYUVAInfo::kMaxPlanes];
 
   for (size_t planeIndex = 0; planeIndex < planesCount; planeIndex++) {
     MTLPixelFormat pixelFormat = getMTLPixelFormatForCVPixelBufferPlane(pixelBuffer, planeIndex);
-    MetalTextureHolder textureHolder = getTextureFromCVPixelBuffer(pixelBuffer, planeIndex, pixelFormat);
-    yuvTextures.push_back(textureHolder);
+    NSLog(@"Plane %zu is in %zu", planeIndex, pixelFormat);
+    GrBackendTexture texture = getTextureFromCVPixelBuffer(pixelBuffer, planeIndex, pixelFormat);
+    textures[planeIndex] = texture;
   }
 
   // 2. Wrap info about buffer
   SkYUVAInfo info = getYUVAInfoForCVPixelBuffer(pixelBuffer);
 
   // 3. Return all textures
-  return new YUVMetalTexturesHolder(info, yuvTextures);
+  return GrYUVABackendTextures(info, textures, kTopLeft_GrSurfaceOrigin);
 }
 
 CVPixelBufferBaseFormat SkiaMetalSurfaceFactory::getCVPixelBufferBaseFormat(CVPixelBufferRef pixelBuffer) {
@@ -373,20 +352,18 @@ sk_sp<SkImage> SkiaMetalSurfaceFactory::makeImageFromCMSampleBuffer(
   switch (baseFormat) {
     case CVPixelBufferBaseFormat::rgb: {
       // It's in RGB (BGRA_32), single plane
-      MetalTextureHolder backendTexture = getTextureFromCVPixelBuffer(pixelBuffer, 0, MTLPixelFormatBGRA8Unorm);
-      auto image = SkImages::AdoptTextureFrom(context->skContext.get(), backendTexture.getSkiaTexture(), kTopLeft_GrSurfaceOrigin,
-                                              kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
+      GrBackendTexture backendTexture = getTextureFromCVPixelBuffer(pixelBuffer, /*planeIndex */ 0, MTLPixelFormatBGRA8Unorm);
+      auto image = SkImages::AdoptTextureFrom(context->skContext.get(), backendTexture, kTopLeft_GrSurfaceOrigin,
+                                              kBGRA_8888_SkColorType, kOpaque_SkAlphaType);
       return image;
     }
     case CVPixelBufferBaseFormat::yuv: {
       // It's in YUV, multi-plane
-      YUVMetalTexturesHolder* textures = getYUVTexturesFromCVPixelBuffer(pixelBuffer);
-      GrYUVABackendTextures yuvTextures = textures->getSkiaTexture();
+      GrYUVABackendTextures textures = getYUVTexturesFromCVPixelBuffer(pixelBuffer);
 
-      auto image = SkImages::TextureFromYUVATextures(context->skContext.get(), yuvTextures, nullptr, [](void* context) {
-        YUVMetalTexturesHolder* textures = (YUVMetalTexturesHolder*)context;
-        delete textures;
-      }, (void*)textures);
+      auto image = SkImages::TextureFromYUVATextures(context->skContext.get(), textures, nullptr, [](void* context) {
+        // TODO:
+      }, nullptr);
       return image;
     }
     default: {
