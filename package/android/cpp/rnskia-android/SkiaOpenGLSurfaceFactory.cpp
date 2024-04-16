@@ -35,11 +35,11 @@ SkiaOpenGLSurfaceFactory::makeImageFromHardwareBuffer(void *buffer) {
 
   AHardwareBuffer_Desc description;
   AHardwareBuffer_describe(hardwareBuffer, &description);
-  if (description.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) {
-    throw std::runtime_error("AHardwareBuffer has unknown format (" +
-                             std::to_string(description.format) +
-                             ") - cannot convert to SkImage!");
-  }
+  // if (description.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) {
+  //   throw std::runtime_error("AHardwareBuffer has unknown format (" +
+  //                            std::to_string(description.format) +
+  //                            ") - cannot convert to SkImage!");
+  // }
   GrBackendFormat format =
       GrBackendFormats::MakeGL(GR_GL_RGBA8, GR_GL_TEXTURE_EXTERNAL);
 

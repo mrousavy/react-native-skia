@@ -58,7 +58,7 @@ export const Breathe = () => {
     if (video === null) {
       return;
     }
-    if (timestamp - lastTimestamp.value > 32) {
+    if (timestamp - lastTimestamp.value > 16) {
       lastTimestamp.value = timestamp;
       if (image.value) {
         image.value.dispose();
