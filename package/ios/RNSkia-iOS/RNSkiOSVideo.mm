@@ -40,7 +40,8 @@ void RNSkiOSVideo::initializeReader() {
   AVAssetTrack *videoTrack =
       [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
   NSDictionary *outputSettings = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferPixelFormatTypeKey :
+        @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
     (id)kCVPixelBufferMetalCompatibilityKey : @YES
   };
   AVAssetReaderTrackOutput *trackOutput =
