@@ -12,6 +12,7 @@
 #pragma clang diagnostic ignored "-Wdocumentation"
 #import "include/core/SkColorSpace.h"
 #import <include/gpu/GrBackendSurface.h>
+#import <include/gpu/ganesh/SkImageGanesh.h>
 #pragma clang diagnostic pop
 
 #include <TargetConditionals.h>
@@ -33,6 +34,14 @@
 
 TextureHolder::TextureHolder(CVMetalTextureRef texture) : _texture(texture) {}
 TextureHolder::~TextureHolder() { CFRelease(_texture); }
+
+TextureHolder &TextureHolder::operator=(const TextureHolder &other) {
+  if (this != &other) {
+    _texture = other._texture;
+    CFRetain(_texture);
+  }
+  return *this;
+}
 
 GrBackendTexture TextureHolder::toGrBackendTexture() {
   // Unwrap the underlying MTLTexture
@@ -59,12 +68,36 @@ SkiaCVPixelBufferUtils::getCVPixelBufferBaseFormat(
   OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
 
   switch (format) {
+  // 8-bit YUV formats
+  case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+  // 10-bit YUV formats
+  case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+    return CVPixelBufferBaseFormat::yuv;
+  case kCVPixelFormatType_24RGB:
+  case kCVPixelFormatType_24BGR:
+  case kCVPixelFormatType_32ARGB:
   case kCVPixelFormatType_32BGRA:
+  case kCVPixelFormatType_32ABGR:
   case kCVPixelFormatType_32RGBA:
+  case kCVPixelFormatType_64ARGB:
+  case kCVPixelFormatType_64RGBALE:
+  case kCVPixelFormatType_48RGB:
+  case kCVPixelFormatType_30RGB:
     return CVPixelBufferBaseFormat::rgb;
   default:
     [[unlikely]] throw std::runtime_error(
-        "CVPixelBuffer has unsupported pixel-format! " +
+        "CVPixelBuffer has unknown pixel format! " +
+        std::string("Expected: any RGB or YUV format, Received: ") +
         std::string(FourCC2Str(format)));
   }
 }
@@ -80,7 +113,7 @@ SkColorType SkiaCVPixelBufferUtils::RGB::getCVPixelBufferColorType(
     [[likely]] return kBGRA_8888_SkColorType;
   case kCVPixelFormatType_32RGBA:
     return kRGBA_8888_SkColorType;
-  // This can be extended with branches for specific RGB formats if new Apple
+  // This can be extended with branches for specific RGB formats if Apple
   // uses new formats.
   default:
     [[unlikely]] throw std::runtime_error(
@@ -89,9 +122,182 @@ SkColorType SkiaCVPixelBufferUtils::RGB::getCVPixelBufferColorType(
   }
 }
 
-TextureHolder *SkiaCVPixelBufferUtils::RGB::getSkiaTextureForCVPixelBuffer(
+sk_sp<SkImage> SkiaCVPixelBufferUtils::RGB::makeSkImageFromCVPixelBuffer(
+    GrDirectContext *context, CVPixelBufferRef pixelBuffer) {
+  // 1. Get Skia color type for RGB buffer
+  SkColorType colorType = getCVPixelBufferColorType(pixelBuffer);
+
+  // 2. Get texture, RGB buffers only have one plane
+  TextureHolder *texture =
+      getSkiaTextureForCVPixelBufferPlane(pixelBuffer, /* planeIndex */ 0);
+
+  // 3. Convert to image with manual memory cleanup
+  return SkImages::BorrowTextureFrom(
+      context, texture->toGrBackendTexture(), kTopLeft_GrSurfaceOrigin,
+      colorType, kOpaque_SkAlphaType, nullptr,
+      [](void *texture) { delete (TextureHolder *)texture; }, (void *)texture);
+}
+
+// pragma MARK: YUV
+
+sk_sp<SkImage> SkiaCVPixelBufferUtils::YUV::makeSkImageFromCVPixelBuffer(
+    GrDirectContext *context, CVPixelBufferRef pixelBuffer) {
+  // 1. Get all planes (YUV, Y_UV, Y_U_V or Y_U_V_A)
+  size_t planesCount = CVPixelBufferGetPlaneCount(pixelBuffer);
+  TextureHolder **textureHolders = new TextureHolder *[planesCount];
+  GrBackendTexture textures[planesCount];
+
+  for (size_t planeIndex = 0; planeIndex < planesCount; planeIndex++) {
+    TextureHolder *textureHolder =
+        getSkiaTextureForCVPixelBufferPlane(pixelBuffer, planeIndex);
+    textureHolders[planeIndex] = textureHolder;
+    textures[planeIndex] = textureHolder->toGrBackendTexture();
+  }
+
+  // 2. Wrap info about buffer
+  SkYUVAInfo info = getYUVAInfoForCVPixelBuffer(pixelBuffer);
+
+  // 3. Wrap as YUVA textures type
+  GrYUVABackendTextures yuvaTextures(info, textures, kTopLeft_GrSurfaceOrigin);
+
+  // 4. Wrap into SkImage type with manualy memory cleanup
+  return SkImages::TextureFromYUVATextures(
+      context, yuvaTextures, nullptr,
+      [](void *textureHolders) { delete[](TextureHolder *) textureHolders; },
+      (void *)textureHolders);
+}
+
+SkYUVAInfo SkiaCVPixelBufferUtils::YUV::getYUVAInfoForCVPixelBuffer(
     CVPixelBufferRef pixelBuffer) {
-  return getSkiaTextureForCVPixelBufferPlane(pixelBuffer, /* planeIndex */ 0);
+  size_t width = CVPixelBufferGetWidth(pixelBuffer);
+  size_t height = CVPixelBufferGetHeight(pixelBuffer);
+  SkISize size =
+      SkISize::Make(static_cast<int>(width), static_cast<int>(height));
+
+  OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+  SkYUVAInfo::PlaneConfig planeConfig = getPlaneConfig(format);
+  SkYUVAInfo::Subsampling subsampling = getSubsampling(format);
+  SkYUVColorSpace colorspace = getColorspace(format);
+
+  return SkYUVAInfo(size, planeConfig, subsampling, colorspace);
+}
+
+// pragma MARK: YUV getPlaneConfig()
+
+SkYUVAInfo::PlaneConfig
+SkiaCVPixelBufferUtils::YUV::getPlaneConfig(OSType pixelFormat) {
+  switch (pixelFormat) {
+  case kCVPixelFormatType_420YpCbCr8Planar:
+  case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+    return SkYUVAInfo::PlaneConfig::kYUV;
+  case kCVPixelFormatType_422YpCbCr_4A_8BiPlanar:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
+    [[likely]] return SkYUVAInfo::PlaneConfig::kY_UV;
+  case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
+  case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
+    return SkYUVAInfo::PlaneConfig::kY_U_V;
+  // This can be extended with branches for specific YUV formats if Apple
+  // uses new formats.
+  default:
+    [[unlikely]] throw std::runtime_error("Invalid pixel format! " +
+                                          std::string(FourCC2Str(pixelFormat)));
+  }
+}
+
+// pragma MARK: YUV getSubsampling()
+
+SkYUVAInfo::Subsampling
+SkiaCVPixelBufferUtils::YUV::getSubsampling(OSType pixelFormat) {
+  switch (pixelFormat) {
+  case kCVPixelFormatType_420YpCbCr8Planar:
+  case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_420YpCbCr8VideoRange_8A_TriPlanar:
+    [[likely]] return SkYUVAInfo::Subsampling::k420;
+  case kCVPixelFormatType_4444YpCbCrA8:
+  case kCVPixelFormatType_4444YpCbCrA8R:
+  case kCVPixelFormatType_4444AYpCbCr8:
+  case kCVPixelFormatType_4444AYpCbCr16:
+  case kCVPixelFormatType_4444AYpCbCrFloat:
+  case kCVPixelFormatType_444YpCbCr8:
+  case kCVPixelFormatType_444YpCbCr10:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar:
+    return SkYUVAInfo::Subsampling::k444;
+  case kCVPixelFormatType_422YpCbCr8:
+  case kCVPixelFormatType_422YpCbCr16:
+  case kCVPixelFormatType_422YpCbCr10:
+  case kCVPixelFormatType_422YpCbCr_4A_8BiPlanar:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr8_yuvs:
+  case kCVPixelFormatType_422YpCbCr8FullRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange:
+    return SkYUVAInfo::Subsampling::k422;
+  // This can be extended with branches for specific YUV formats if Apple
+  // uses new formats.
+  default:
+    [[unlikely]] throw std::runtime_error("Invalid pixel format! " +
+                                          std::string(FourCC2Str(pixelFormat)));
+  }
+}
+
+// pragma MARK: YUV getColorspace()
+
+SkYUVColorSpace SkiaCVPixelBufferUtils::YUV::getColorspace(OSType pixelFormat) {
+  switch (pixelFormat) {
+  case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
+    [[likely]]
+    // 8-bit limited
+    return SkYUVColorSpace::kRec709_Limited_SkYUVColorSpace;
+  case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+  case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr8FullRange:
+    [[likely]]
+    // 8-bit full
+    return SkYUVColorSpace::kRec709_Full_SkYUVColorSpace;
+  case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+    // 10-bit limited
+    return SkYUVColorSpace::kBT2020_10bit_Limited_SkYUVColorSpace;
+  case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
+  case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
+    // 10-bit full
+    return SkYUVColorSpace::kBT2020_10bit_Full_SkYUVColorSpace;
+  // This can be extended with branches for specific YUV formats if Apple
+  // uses new formats.
+  default:
+    [[unlikely]] throw std::runtime_error("Invalid pixel format! " +
+                                          std::string(FourCC2Str(pixelFormat)));
+  }
 }
 
 // pragma MARK: CVPixelBuffer -> Skia Texture
