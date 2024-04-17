@@ -66,8 +66,16 @@ sk_sp<SkImage> RNSkiOSVideo::nextImage(double *timeStamp) {
     return nullptr;
   }
 
+ // Extract the pixel buffer from the sample buffer
+  CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+  if (!pixelBuffer) {
+    NSLog(@"No pixel buffer.");
+    CFRelease(sampleBuffer);
+    return nullptr;
+  }
+
   auto skImage = _context->makeImageFromNativeBuffer(
-      reinterpret_cast<void *>(sampleBuffer));
+      reinterpret_cast<void *>(pixelBuffer));
 
   if (timeStamp) {
     CMTime time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);

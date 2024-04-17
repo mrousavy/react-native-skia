@@ -148,6 +148,11 @@ uint64_t RNSkiOSPlatformContext::makeNativeBuffer(sk_sp<SkImage> image) {
   return reinterpret_cast<uint64_t>(pixelBuffer);
 }
 
+std::shared_ptr<RNSkVideo>
+RNSkiOSPlatformContext::createVideo(const std::string &url) {
+  return std::make_shared<RNSkiOSVideo>(url, this);
+}
+
 void RNSkiOSPlatformContext::raiseError(const std::exception &err) {
   RCTFatal(RCTErrorWithMessage([NSString stringWithUTF8String:err.what()]));
 }
