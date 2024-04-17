@@ -144,34 +144,8 @@ uint64_t RNSkiOSPlatformContext::makeNativeBuffer(sk_sp<SkImage> image) {
         std::to_string(result));
   }
 
-  // 6. Create CMSampleBuffer base information
-  CMFormatDescriptionRef formatDescription = nullptr;
-  CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer,
-                                               &formatDescription);
-  CMSampleTimingInfo timingInfo = {0};
-  timingInfo.duration = kCMTimeInvalid;
-  timingInfo.presentationTimeStamp = kCMTimeZero;
-  timingInfo.decodeTimeStamp = kCMTimeInvalid;
-
-  // 7. Wrap the CVPixelBuffer in a CMSampleBuffer
-  CMSampleBufferRef sampleBuffer = nullptr;
-  OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(
-      kCFAllocatorDefault, pixelBuffer, formatDescription, &timingInfo,
-      &sampleBuffer);
-  if (status != noErr) {
-    if (formatDescription) {
-      CFRelease(formatDescription);
-    }
-    if (pixelBuffer) {
-      CFRelease(pixelBuffer);
-    }
-    throw std::runtime_error(
-        "Failed to wrap CVPixelBuffer in CMSampleBuffer! Return value: " +
-        std::to_string(status));
-  }
-
-  // 8. Return CMsampleBuffer casted to uint64_t
-  return reinterpret_cast<uint64_t>(sampleBuffer);
+  // 8. Return CVPixelBuffer casted to uint64_t
+  return reinterpret_cast<uint64_t>(pixelBuffer);
 }
 
 void RNSkiOSPlatformContext::raiseError(const std::exception &err) {
@@ -184,39 +158,8 @@ sk_sp<SkSurface> RNSkiOSPlatformContext::makeOffscreenSurface(int width,
 }
 
 sk_sp<SkImage> RNSkiOSPlatformContext::makeImageFromNativeBuffer(void *buffer) {
-  CMSampleBufferRef sampleBuffer = (CMSampleBufferRef)buffer;
-  // TODO: to debug, we may need to remove makeTextureFromCMSampleBuffer
-  //return SkiaMetalSurfaceFactory::makeTextureFromCMSampleBuffer(sampleBuffer);
-	  //  Step 1: Extract the CVPixelBufferRef from the CMSampleBufferRef
-	  CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-
-	  // Step 2: Lock the pixel buffer to access the raw pixel data
-	  CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-
-	  // Step 3: Get information about the image
-	  void *baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
-	  size_t width = CVPixelBufferGetWidth(pixelBuffer);
-	  size_t height = CVPixelBufferGetHeight(pixelBuffer);
-	  size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
-
-	  // Assuming the pixel format is 32BGRA, which is common for iOS video frames.
-	  // You might need to adjust this based on the actual pixel format.
-	  SkImageInfo info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType,
-										   kUnpremul_SkAlphaType);
-
-	  // Step 4: Create an SkImage from the pixel buffer
-	  sk_sp<SkData> data =
-		  SkData::MakeWithoutCopy(baseAddress, height * bytesPerRow);
-	  sk_sp<SkImage> image = SkImages::RasterFromData(info, data, bytesPerRow);
-	  auto texture = SkiaMetalSurfaceFactory::makeTextureFromImage(image);
-	  // Step 5: Unlock the pixel buffer
-	  CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-	  return texture;
-}
-
-std::shared_ptr<RNSkVideo>
-RNSkiOSPlatformContext::createVideo(const std::string &url) {
-  return std::make_shared<RNSkiOSVideo>(url, this);
+  CVPixelBufferRef sampleBuffer = (CVPixelBufferRef)buffer;
+  return SkiaMetalSurfaceFactory::makeTextureFromCVPixelBuffer(sampleBuffer);
 }
 
 sk_sp<SkFontMgr> RNSkiOSPlatformContext::createFontMgr() {
